@@ -1320,19 +1320,3 @@ class DatasetBuilder:
             return (filt_avg, norm_avg)
         else:
             return (None, None)
-
-    def cal_smv(self, sample: np.ndarray) -> np.ndarray:
-        '''
-        Function to calculate Signal Magnitude Vector (SMV)
-        
-        Parameters:
-        - sample: Input signal array of shape (N, 3) for X,Y,Z accelerometer data
-        
-        Returns:
-        - SMV values of shape (N, 1)
-        '''
-        mean = np.mean(sample, axis=-2, keepdims=True)
-        zero_mean = sample - mean
-        sum_squared = np.sum(np.square(zero_mean), axis=-1, keepdims=True)
-        smv = np.sqrt(sum_squared)
-        return smv
