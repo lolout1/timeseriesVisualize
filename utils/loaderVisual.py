@@ -1,243 +1,495 @@
+"""
+File: loader.py
+
+Description:
+    - Contains definitions for:
+       1) fall_detection_filter (median + Butterworth)
+       2) butterworth_filter (Butterworth Only)
+       3) DatasetBuilder class that:
+          - Loads raw/filtered/normalized accelerometer data
+          - Provides multiple visualization methods:
+             a) visualize_subject_activity (raw vs. filter+norm)
+             b) visualize_subject_activity_normonly (norm-only phone vs. watch)
+             c) visualize_activity_average (per-activity average)
+             d) create_all_activities_summary (combine all activities)
+             e) visualize_activity_subject_averages_in_same_subplot (filtered+norm averages)
+             f) visualize_activity_all_trials_same_subplot (filtered+norm, phone+watch overlaid)
+             g) visualize_trial_normxyz_smv (per-trial normalized X,Y,Z and SMV plots)
+             h) visualize_trial_comparison (compare both filtering pipelines)
+"""
 import os
 from typing import List, Dict, Tuple, Optional
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.signal import butter, filtfilt, medfilt
 from sklearn.preprocessing import StandardScaler
-from filterpy.kalman import KalmanFilter
 
-from processor.base import Processor
+from processor.base import Processor  # Ensure this path is correct
 
-class KalmanSVM:
-    """
-    Kalman filter optimized for SVM signals from accelerometer data.
-    Uses different parameters for watch vs phone due to their distinct noise characteristics.
-    """
-    def __init__(self, 
-                 sensor_type: str = 'phone',
-                 dt: float = 1/31.25,  # Default sampling period for ~31.25Hz
-                 process_variance_phone: float = 0.1,
-                 process_variance_watch: float = 0.3,  # Higher for watch due to more movement
-                 measurement_variance_phone: float = 0.5,
-                 measurement_variance_watch: float = 1.0):  # Higher for watch noise
-        
-        self.kf = KalmanFilter(dim_x=2, dim_z=1)  # State: [position, velocity]
-        
-        # Initialize state transition matrix
-        self.kf.F = np.array([[1., dt],
-                             [0., 1.]])
-        
-        # Initialize measurement matrix
-        self.kf.H = np.array([[1., 0.]])
-        
-        # Set process noise (Q) based on sensor type
-        if sensor_type == 'watch':
-            q = process_variance_watch
-            r = measurement_variance_watch
-        else:  # phone
-            q = process_variance_phone
-            r = measurement_variance_phone
-            
-        # Process noise matrix
-        self.kf.Q = np.array([[q*(dt**4)/4, q*(dt**3)/2],
-                             [q*(dt**3)/2, q*(dt**2)]])
-        
-        # Measurement noise
-        self.kf.R = np.array([[r]])
-        
-        # Initial state covariance
-        self.kf.P *= 10
-        
-    def filter(self, measurements: np.ndarray) -> np.ndarray:
-        """Apply Kalman filtering to a sequence of measurements."""
-        filtered_state_means = np.zeros_like(measurements)
-        
-        # Initialize state with first measurement
-        self.kf.x = np.array([[measurements[0]], [0.]])
-        
-        for i, measurement in enumerate(measurements):
-            # Predict
-            self.kf.predict()
-            # Update
-            self.kf.update(measurement)
-            # Store filtered estimate
-            filtered_state_means[i] = self.kf.x[0]
-            
-        return filtered_state_means
 
-def calculate_svm(data: np.ndarray) -> np.ndarray:
+# ---------------- FILTERING FUNCTIONS ---------------- #
+def fall_detection_filter(data: np.ndarray, fs: float = 31.25) -> np.ndarray:
     """
-    Calculate Signal Vector Magnitude (SVM) from 3-axis accelerometer data.
-    
+    A two-stage filtering approach optimized for ~31.25Hz accelerometer data:
+      1) Median filter (window=5)
+      2) Low-pass Butterworth (cutoff ~7Hz, order=6)
+
     Parameters:
     - data: Input signal array (N, 3), columns => x, y, z
-    
-    Returns:
-    - SVM signal array (N,)
-    """
-    return np.sqrt(np.sum(data**2, axis=1))
-
-def optimized_filter_pipeline(data: np.ndarray, 
-                            sensor_type: str = 'phone',
-                            fs: float = 31.25) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Optimized filtering pipeline for fall detection:
-    1. Butterworth low-pass filter (tuned differently for phone vs watch)
-    2. Normalization
-    3. SVM calculation
-    4. Kalman filtering on SVM
-    
-    Parameters:
-    - data: Input signal array (N, 3)
-    - sensor_type: 'phone' or 'watch'
     - fs: Sampling frequency in Hz
-    
+
     Returns:
-    - Tuple of (filtered_data, filtered_svm)
+    - Filtered signal array (N, 3)
     """
-    # 1. Butterworth filter parameters
-    if sensor_type == 'watch':
-        order = 6
-        cutoff = 5.0  # Lower cutoff for watch due to more hand movement
-    else:  # phone
-        order = 4
-        cutoff = 7.0  # Higher cutoff for phone to preserve more signal
-        
+    # 1) Median filter
+    filtered_data = np.zeros_like(data)
+    for axis in range(3):
+        filtered_data[:, axis] = medfilt(data[:, axis], kernel_size=5)  # Kernel size = 5
+
+    # 2) Low-pass Butterworth
+    order = 6
+    cutoff = 7.0  # Hz
     nyquist = fs * 0.5
     normal_cutoff = cutoff / nyquist
     b, a = butter(order, normal_cutoff, btype='low', analog=False)
-    
-    # Apply filter with padding to avoid edge effects
+
+    pad_size = order * 4
+    padded = np.pad(filtered_data, ((pad_size, pad_size), (0, 0)), mode='edge')
+
+    final_filtered = np.zeros_like(padded)
+    for axis in range(3):
+        final_filtered[:, axis] = filtfilt(b, a, padded[:, axis])
+
+    return final_filtered[pad_size:-pad_size, :]
+
+
+def butterworth_filter(data: np.ndarray, cutoff: float = 7.0, fs: float = 31.25, order: int = 6) -> np.ndarray:
+    """
+    Applies only a Butterworth low-pass filter to the data.
+
+    Parameters:
+    - data: Input signal array (N, 3)
+    - cutoff: Cutoff frequency in Hz
+    - fs: Sampling frequency in Hz
+    - order: Order of the Butterworth filter
+
+    Returns:
+    - Filtered signal array (N, 3)
+    """
+    nyquist = fs * 0.5
+    normal_cutoff = cutoff / nyquist
+    b, a = butter(order, normal_cutoff, btype='low', analog=False)
+
     pad_size = order * 4
     padded = np.pad(data, ((pad_size, pad_size), (0, 0)), mode='edge')
-    filtered = np.zeros_like(padded)
-    
-    for axis in range(3):
-        filtered[:, axis] = filtfilt(b, a, padded[:, axis])
-    
-    filtered = filtered[pad_size:-pad_size, :]
-    
-    # 2. Normalize to remove gravity component and scale data
-    scaler = StandardScaler()
-    normalized = scaler.fit_transform(filtered)
-    
-    # 3. Calculate SVM
-    svm = calculate_svm(normalized)
-    
-    # 4. Apply Kalman filter to SVM
-    kalman = KalmanSVM(sensor_type=sensor_type)
-    filtered_svm = kalman.filter(svm)
-    
-    return normalized, filtered_svm
 
+    final_filtered = np.zeros_like(padded)
+    for axis in range(3):
+        final_filtered[:, axis] = filtfilt(b, a, padded[:, axis])
+
+    return final_filtered[pad_size:-pad_size, :]
+
+
+# ---------------- DATASET BUILDER ---------------- #
 class DatasetBuilder:
     """
-    Enhanced dataset builder with optimized filtering pipeline for fall detection.
+    Builds a dataset from matched trials, storing raw, filtered (two pipelines), normalized data.
+    Provides multiple visualization methods.
     """
-    def __init__(self, dataset: object, mode: str, max_length: int, 
-                 task: str = 'fd', fs: float = 31.25, **kwargs) -> None:
+
+    def __init__(self, dataset: object, mode: str, max_length: int, task: str = 'fd', fs: float = 31.25, **kwargs) -> None:
         self.dataset = dataset
         self.mode = mode
         self.max_length = max_length
         self.task = task
-        self.fs = fs
+        self.fs = fs  # Sampling frequency
         self.kwargs = kwargs
-        
-        # Storage for processed data
-        self.normalized_data: Dict[str, np.ndarray] = {}
-        self.svm_data: Dict[str, np.ndarray] = {}
-        self.labels: np.ndarray = np.array([])
-        self.successful_indices: List[int] = []
-        
-        # Raw data storage
-        self._raw_data: Dict[str, List[np.ndarray]] = {}
-    
-    def make_dataset(self, subjects: List[int]) -> None:
-        """Load and process data for specified subjects."""
-        print(f"\n[INFO] Processing data for subjects: {subjects}")
+
+        self.data_with_med: Dict[str, np.ndarray] = {}
+        self.data_without_med: Dict[str, np.ndarray] = {}
+        self.labels_with_med: np.ndarray = np.array([])
+        self.labels_without_med: np.ndarray = np.array([])
+        self.successful_indices_with_med: List[int] = []  # Track successful trials for with_med
+        self.successful_indices_without_med: List[int] = []  # Track successful trials for without_med
+
+        self._raw_data_with_med: Dict[str, List[np.ndarray]] = {}
+        self._raw_data_without_med: Dict[str, List[np.ndarray]] = {}
+        self._filtered_with_med: Dict[str, List[np.ndarray]] = {}
+        self._filtered_without_med: Dict[str, List[np.ndarray]] = {}
+        self._normalized_with_med: Dict[str, np.ndarray] = {}
+        self._normalized_without_med: Dict[str, np.ndarray] = {}
+
+    # ---------------- MAKE DATASET WITH MEDIAN + BUTTERWORTH ---------------- #
+    def make_dataset_with_med(self, subjects: List[int]) -> None:
+        """
+        Load data for specified subjects, storing raw & filtered signals using Median + Butterworth filter.
+        """
+        print(f"\n[INFO] Making dataset with Median + Butterworth for subjects: {subjects}")
         trial_subjects = {t.subject_id for t in self.dataset.matched_trials}
         matching = set(subjects) & trial_subjects
-        
+
+        print("\n[INFO] Subject statistics:")
+        print(f"Subjects in matched trials: {sorted(list(trial_subjects))}")
+        print(f"Requested subjects: {sorted(list(subjects))}")
+        print(f"Matching subjects: {sorted(list(matching))}")
+
         if not matching:
-            print("\n[WARNING] No matching subjects found!")
+            print("\n[WARNING] No matching subjects found for Median + Butterworth pipeline!")
             return
-            
+
         needs_cleaning_dir = os.path.join(self.dataset.root_dir, 'needs_cleaning')
         os.makedirs(needs_cleaning_dir, exist_ok=True)
-        
-        # Initialize storage
-        self._raw_data = {'labels': []}
-        
+        print(f"[INFO] Using needs_cleaning directory: {needs_cleaning_dir}")
+
+        # Initialize raw and filtered data storage
+        self._raw_data_with_med = {'labels': []}
+        self._filtered_with_med = {}
+
         processed = 0
         for idx, trial in enumerate(self.dataset.matched_trials):
             if trial.subject_id not in matching:
                 continue
-                
+
             label = self._compute_label(trial)
             processed += 1
-            
+            print(f"[INFO] Processing (with_med) trial: S{trial.subject_id:02d}A{trial.action_id:02d}T{trial.sequence_number:02d}")
+
             success = True
+
             for mod_key, file_path in trial.files.items():
                 try:
-                    # Determine sensor type
-                    sensor_type = 'watch' if 'watch' in mod_key else 'phone'
-                    
-                    # Read raw data
+                    # 1) Read raw
                     processor = Processor(file_path, self.mode, self.max_length)
                     raw_arr = processor.process()
-                    
-                    if mod_key not in self._raw_data:
-                        self._raw_data[mod_key] = []
-                    self._raw_data[mod_key].append(raw_arr)
-                    
-                    # Apply optimized filtering pipeline
-                    normalized, filtered_svm = optimized_filter_pipeline(
-                        raw_arr, sensor_type=sensor_type, fs=self.fs
-                    )
-                    
-                    # Store processed data
-                    if mod_key not in self.normalized_data:
-                        self.normalized_data[mod_key] = []
-                        self.svm_data[mod_key] = []
-                    
-                    self.normalized_data[mod_key].append(normalized)
-                    self.svm_data[mod_key].append(filtered_svm)
-                    
+
+                    # store raw
+                    if mod_key not in self._raw_data_with_med:
+                        self._raw_data_with_med[mod_key] = []
+                    self._raw_data_with_med[mod_key].append(raw_arr)
+
+                    # 2a) Filter with Median + Butterworth
+                    filt_with_med = fall_detection_filter(raw_arr, fs=self.fs)
+                    if mod_key not in self._filtered_with_med:
+                        self._filtered_with_med[mod_key] = []
+                    self._filtered_with_med[mod_key].append(filt_with_med)
                 except Exception as e:
-                    print(f"[ERROR] Error processing file {file_path}: {e}")
+                    print(f"[ERROR] (with_med) Error processing file {file_path}: {e}")
                     self._copy_to_needs_cleaning(needs_cleaning_dir, file_path)
                     success = False
                     break
-                    
+
             if success:
-                self.successful_indices.append(idx)
-                self._raw_data['labels'].append(label)
-                self.labels = np.array(self._raw_data['labels'])
-        
-        print(f"\n[INFO] Successfully processed {len(self.successful_indices)} out of {processed} trials")
-        
-        # Convert lists to numpy arrays
-        for k in self.normalized_data.keys():
-            self.normalized_data[k] = np.array(self.normalized_data[k])
-            self.svm_data[k] = np.array(self.svm_data[k])
-            print(f"[INFO] {k} shapes - Normalized: {self.normalized_data[k].shape}, SVM: {self.svm_data[k].shape}")
+                self.successful_indices_with_med.append(idx)
+                self._raw_data_with_med['labels'].append(label)
+                for mk, arr_ in self._filtered_with_med.items():
+                    self.data_with_med.setdefault(mk, []).append(arr_[-1])  # Append the latest filtered data
+                self.labels_with_med = np.array(self._raw_data_with_med['labels'])
 
+        print(f"\n[INFO] (with_med) Processed {processed} trials")
+        print(f"[INFO] (with_med) Total trials processed successfully: {len(self.successful_indices_with_med)}")
+
+        if not self.labels_with_med.size:
+            print("\n[WARNING] No data was loaded for Median + Butterworth pipeline. Exiting dataset preparation.")
+            return
+
+        print("\n[INFO] Converting Median + Butterworth data to numpy arrays...")
+        for k, arr_list in self.data_with_med.items():
+            if k == 'labels':
+                continue
+            try:
+                stacked = np.stack(arr_list, axis=0)
+                self.data_with_med[k] = stacked
+                print(f"[INFO] (with_med) {k} shape: {stacked.shape}")
+            except Exception as e:
+                print(f"[ERROR] (with_med) Error stacking {k}: {e}")
+
+    # ---------------- MAKE DATASET WITH BUTTERWORTH ONLY ---------------- #
+    def make_dataset_without_med(self, subjects: List[int]) -> None:
+        """
+        Load data for specified subjects, storing raw & filtered signals using Butterworth Only filter.
+        """
+        print(f"\n[INFO] Making dataset with Butterworth Only for subjects: {subjects}")
+        trial_subjects = {t.subject_id for t in self.dataset.matched_trials}
+        matching = set(subjects) & trial_subjects
+
+        print("\n[INFO] Subject statistics:")
+        print(f"Subjects in matched trials: {sorted(list(trial_subjects))}")
+        print(f"Requested subjects: {sorted(list(subjects))}")
+        print(f"Matching subjects: {sorted(list(matching))}")
+
+        if not matching:
+            print("\n[WARNING] No matching subjects found for Butterworth Only pipeline!")
+            return
+
+        needs_cleaning_dir = os.path.join(self.dataset.root_dir, 'needs_cleaning')
+        os.makedirs(needs_cleaning_dir, exist_ok=True)
+        print(f"[INFO] Using needs_cleaning directory: {needs_cleaning_dir}")
+
+        # Initialize raw and filtered data storage
+        self._raw_data_without_med = {'labels': []}
+        self._filtered_without_med = {}
+
+        processed = 0
+        for idx, trial in enumerate(self.dataset.matched_trials):
+            if trial.subject_id not in matching:
+                continue
+
+            label = self._compute_label(trial)
+            processed += 1
+            print(f"[INFO] Processing (without_med) trial: S{trial.subject_id:02d}A{trial.action_id:02d}T{trial.sequence_number:02d}")
+
+            success = True
+
+            for mod_key, file_path in trial.files.items():
+                try:
+                    # 1) Read raw
+                    processor = Processor(file_path, self.mode, self.max_length)
+                    raw_arr = processor.process()
+
+                    # store raw
+                    if mod_key not in self._raw_data_without_med:
+                        self._raw_data_without_med[mod_key] = []
+                    self._raw_data_without_med[mod_key].append(raw_arr)
+
+                    # 2a) Filter with Butterworth Only
+                    filt_without_med = butterworth_filter(raw_arr, cutoff=7.0, fs=self.fs, order=6)
+                    if mod_key not in self._filtered_without_med:
+                        self._filtered_without_med[mod_key] = []
+                    self._filtered_without_med[mod_key].append(filt_without_med)
+                except Exception as e:
+                    print(f"[ERROR] (without_med) Error processing file {file_path}: {e}")
+                    self._copy_to_needs_cleaning(needs_cleaning_dir, file_path)
+                    success = False
+                    break
+
+            if success:
+                self.successful_indices_without_med.append(idx)
+                self._raw_data_without_med['labels'].append(label)
+                for mk, arr_ in self._filtered_without_med.items():
+                    self.data_without_med.setdefault(mk, []).append(arr_[-1])  # Append the latest filtered data
+                self.labels_without_med = np.array(self._raw_data_without_med['labels'])
+
+        print(f"\n[INFO] (without_med) Processed {processed} trials")
+        print(f"[INFO] (without_med) Total trials processed successfully: {len(self.successful_indices_without_med)}")
+
+        if not self.labels_without_med.size:
+            print("\n[WARNING] No data was loaded for Butterworth Only pipeline. Exiting dataset preparation.")
+            return
+
+        print("\n[INFO] Converting Butterworth Only data to numpy arrays...")
+        for k, arr_list in self.data_without_med.items():
+            if k == 'labels':
+                continue
+            try:
+                stacked = np.stack(arr_list, axis=0)
+                self.data_without_med[k] = stacked
+                print(f"[INFO] (without_med) {k} shape: {stacked.shape}")
+            except Exception as e:
+                print(f"[ERROR] (without_med) Error stacking {k}: {e}")
+
+    # ---------------- NORMALIZE WITH MEDIAN + BUTTERWORTH ---------------- #
+    def normalize_with_med(self) -> None:
+        """
+        Normalizes the Median + Butterworth filtered data and stores in self._normalized_with_med.
+        """
+        print("\n[INFO] Normalizing data with Median + Butterworth filtering...")
+        self._normalized_with_med.clear()
+        for k, arr in self.data_with_med.items():
+            if k == 'labels':
+                continue
+            print(f"[INFO] Normalizing (with_med) {k}...")
+            shape_ = arr.shape
+            flattened = arr.reshape(-1, shape_[-1])
+
+            scaler = StandardScaler()
+            norm_flat = scaler.fit_transform(flattened + 1e-10)  # Adding epsilon to avoid division by zero
+            norm_arr = norm_flat.reshape(shape_)
+            self._normalized_with_med[k] = norm_arr
+            print(f"[INFO] (with_med) {k} normalized shape: {norm_arr.shape}")
+
+    # ---------------- NORMALIZE WITH BUTTERWORTH ONLY ---------------- #
+    def normalize_without_med(self) -> None:
+        """
+        Normalizes the Butterworth Only filtered data and stores in self._normalized_without_med.
+        """
+        print("\n[INFO] Normalizing data with Butterworth Only filtering...")
+        self._normalized_without_med.clear()
+        for k, arr in self.data_without_med.items():
+            if k == 'labels':
+                continue
+            print(f"[INFO] Normalizing (without_med) {k}...")
+            shape_ = arr.shape
+            flattened = arr.reshape(-1, shape_[-1])
+
+            scaler = StandardScaler()
+            norm_flat = scaler.fit_transform(flattened + 1e-10)
+            norm_arr = norm_flat.reshape(shape_)
+            self._normalized_without_med[k] = norm_arr
+            print(f"[INFO] (without_med) {k} normalized shape: {norm_arr.shape}")
+
+    # ---------------- VISUALIZATION METHODS ---------------- #
+    # The visualization methods have been updated to handle axes correctly.
+
+    def visualize_and_save_all(self, output_root: str) -> None:
+        """
+        Generates and saves all visualizations for both filtering pipelines.
+        """
+        print(f"\n[INFO] Generating and saving visualizations to '{output_root}'...")
+        os.makedirs(output_root, exist_ok=True)
+
+        from collections import defaultdict
+        trial_map_with_med = defaultdict(list)
+        trial_map_without_med = defaultdict(list)
+
+        # Group by (activity, subject) for with_med
+        for relative_idx, global_idx in enumerate(self.successful_indices_with_med):
+            trial = self.dataset.matched_trials[global_idx]
+            trial_map_with_med[(trial.action_id, trial.subject_id)].append(relative_idx)
+
+        # Group by (activity, subject) for without_med
+        for relative_idx, global_idx in enumerate(self.successful_indices_without_med):
+            trial = self.dataset.matched_trials[global_idx]
+            trial_map_without_med[(trial.action_id, trial.subject_id)].append(relative_idx)
+
+        # Distinct activity IDs
+        activity_set_with_med = set(act_id for (act_id, _) in trial_map_with_med.keys())
+        activity_set_without_med = set(act_id for (act_id, _) in trial_map_without_med.keys())
+        all_activities = sorted(activity_set_with_med | activity_set_without_med)
+
+        print("\n[INFO] Generating visualizations for Median + Butterworth pipeline...")
+        for act_id in all_activities:
+            activity_dir = os.path.join(output_root, f"A{act_id}")
+            os.makedirs(activity_dir, exist_ok=True)
+
+            # Subjects for this activity in with_med
+            subject_ids_with_med = sorted([sub_id for (a, sub_id) in trial_map_with_med.keys() if a == act_id])
+
+            for subj_id in subject_ids_with_med:
+                subject_dir = os.path.join(activity_dir, f"S{subj_id:02d}")
+                os.makedirs(subject_dir, exist_ok=True)
+
+                idx_list = trial_map_with_med.get((act_id, subj_id), [])
+                idx_list_sorted = sorted(idx_list, key=lambda x: self.dataset.matched_trials[self.successful_indices_with_med[x]].sequence_number)
+
+                # a) Raw vs. Filter+Norm
+                fig1 = self.visualize_subject_activity(idx_list_sorted, subj_id, act_id, pipeline='with_med')
+                if fig1:
+                    raw_filter_file = os.path.join(subject_dir, f"S{subj_id:02d}_raw_filter_with_med.png")
+                    fig1.savefig(raw_filter_file, dpi=150)
+                    plt.close(fig1)
+                    print(f"[INFO] Saved {raw_filter_file}")
+
+                # b) Norm-only phone vs watch
+                fig2 = self.visualize_subject_activity_normonly(idx_list_sorted, subj_id, act_id, pipeline='with_med')
+                if fig2:
+                    normonly_file = os.path.join(subject_dir, f"S{subj_id:02d}_normonly_with_med.png")
+                    fig2.savefig(normonly_file, dpi=150)
+                    plt.close(fig2)
+                    print(f"[INFO] Saved {normonly_file}")
+
+                # c) Per-trial normalized X,Y,Z and SMV
+                for relative_idx in idx_list_sorted:
+                    global_idx = self.successful_indices_with_med[relative_idx]
+                    trial_obj = self.dataset.matched_trials[global_idx]
+                    seq_num = trial_obj.sequence_number
+
+                    # Per-Trial Normalized Plots
+                    fig_xyz_med, fig_smv_med = self.visualize_trial_normxyz_smv(global_idx, pipeline='with_med')
+                    if fig_xyz_med and fig_smv_med:
+                        out_xyz_med = os.path.join(subject_dir, f"T{seq_num:02d}_normxyz_with_med.png")
+                        out_smv_med = os.path.join(subject_dir, f"T{seq_num:02d}_normsmv_with_med.png")
+                        fig_xyz_med.savefig(out_xyz_med, dpi=150)
+                        fig_smv_med.savefig(out_smv_med, dpi=150)
+                        plt.close(fig_xyz_med)
+                        plt.close(fig_smv_med)
+                        print(f"[INFO] Saved {out_xyz_med} and {out_smv_med}")
+
+                # d) Subject Averages in Same Subplot
+                fig_avg_med = self.visualize_activity_subject_averages_in_same_subplot(act_id, [subj_id], pipeline='with_med')
+                if fig_avg_med:
+                    avg_file_med = os.path.join(subject_dir, f"S{subj_id:02d}_average_with_med.png")
+                    fig_avg_med.savefig(avg_file_med, dpi=150)
+                    plt.close(fig_avg_med)
+                    print(f"[INFO] Saved {avg_file_med}")
+
+        print("\n[INFO] Generating visualizations for Butterworth Only pipeline...")
+        for act_id in all_activities:
+            activity_dir = os.path.join(output_root, f"A{act_id}")
+            os.makedirs(activity_dir, exist_ok=True)
+
+            # Subjects for this activity in without_med
+            subject_ids_without_med = sorted([sub_id for (a, sub_id) in trial_map_without_med.keys() if a == act_id])
+
+            for subj_id in subject_ids_without_med:
+                subject_dir = os.path.join(activity_dir, f"S{subj_id:02d}")
+                os.makedirs(subject_dir, exist_ok=True)
+
+                idx_list = trial_map_without_med.get((act_id, subj_id), [])
+                idx_list_sorted = sorted(idx_list, key=lambda x: self.dataset.matched_trials[self.successful_indices_without_med[x]].sequence_number)
+
+                # a) Raw vs. Filter+Norm
+                fig1 = self.visualize_subject_activity(idx_list_sorted, subj_id, act_id, pipeline='without_med')
+                if fig1:
+                    raw_filter_file = os.path.join(subject_dir, f"S{subj_id:02d}_raw_filter_without_med.png")
+                    fig1.savefig(raw_filter_file, dpi=150)
+                    plt.close(fig1)
+                    print(f"[INFO] Saved {raw_filter_file}")
+
+                # b) Norm-only phone vs watch
+                fig2 = self.visualize_subject_activity_normonly(idx_list_sorted, subj_id, act_id, pipeline='without_med')
+                if fig2:
+                    normonly_file = os.path.join(subject_dir, f"S{subj_id:02d}_normonly_without_med.png")
+                    fig2.savefig(normonly_file, dpi=150)
+                    plt.close(fig2)
+                    print(f"[INFO] Saved {normonly_file}")
+
+                # c) Per-trial normalized X,Y,Z and SMV
+                for relative_idx in idx_list_sorted:
+                    global_idx = self.successful_indices_without_med[relative_idx]
+                    trial_obj = self.dataset.matched_trials[global_idx]
+                    seq_num = trial_obj.sequence_number
+
+                    # Per-Trial Normalized Plots
+                    fig_xyz_bw, fig_smv_bw = self.visualize_trial_normxyz_smv(global_idx, pipeline='without_med')
+                    if fig_xyz_bw and fig_smv_bw:
+                        out_xyz_bw = os.path.join(subject_dir, f"T{seq_num:02d}_normxyz_without_med.png")
+                        out_smv_bw = os.path.join(subject_dir, f"T{seq_num:02d}_normsmv_without_med.png")
+                        fig_xyz_bw.savefig(out_xyz_bw, dpi=150)
+                        fig_smv_bw.savefig(out_smv_bw, dpi=150)
+                        plt.close(fig_xyz_bw)
+                        plt.close(fig_smv_bw)
+                        print(f"[INFO] Saved {out_xyz_bw} and {out_smv_bw}")
+
+                # d) Subject Averages in Same Subplot
+                fig_avg_bw = self.visualize_activity_subject_averages_in_same_subplot(act_id, [subj_id], pipeline='without_med')
+                if fig_avg_bw:
+                    avg_file_bw = os.path.join(subject_dir, f"S{subj_id:02d}_average_without_med.png")
+                    fig_avg_bw.savefig(avg_file_bw, dpi=150)
+                    plt.close(fig_avg_bw)
+                    print(f"[INFO] Saved {avg_file_bw}")
+
+    # ---------------- HELPER METHODS ---------------- #
     def _compute_label(self, trial) -> int:
-        """Compute binary labels for fall detection task."""
+        """Basic logic for 'fd' => 1 if action_id>9 else 0, or 'age', etc."""
         if self.task == 'fd':
-            return int(trial.action_id > 9)  # Fall events typically have higher action IDs
-        return trial.action_id - 1
+            return int(trial.action_id > 9)
+        elif self.task == 'age':
+            return int(trial.subject_id < 29 or trial.subject_id > 46)
+        else:
+            return trial.action_id - 1
 
-    def _copy_to_needs_cleaning(self, needs_cleaning_dir: str, file_path: str) -> None:
-        """Copy problematic files to needs_cleaning directory."""
+    def _copy_to_needs_cleaning(self, needs_cleaning_dir: str, file_path: str):
         import shutil
         try:
             rel_path = os.path.relpath(os.path.dirname(file_path), self.dataset.root_dir)
             target_dir = os.path.join(needs_cleaning_dir, rel_path)
             os.makedirs(target_dir, exist_ok=True)
-            shutil.copy2(file_path, os.path.join(target_dir, os.path.basename(file_path)))
+            out_file = os.path.join(target_dir, os.path.basename(file_path))
+            shutil.copy2(file_path, out_file)
+            print(f"[INFO] Successfully copied {os.path.basename(file_path)} to {out_file} for cleaning")
         except Exception as e:
             print(f"[ERROR] Error copying file {file_path}: {e}")
+
     # ---------------- VISUALIZATION METHODS ---------------- #
     def visualize_subject_activity(
         self, 
@@ -1068,19 +1320,3 @@ class DatasetBuilder:
             return (filt_avg, norm_avg)
         else:
             return (None, None)
-
-    def cal_smv(self, sample: np.ndarray) -> np.ndarray:
-        '''
-        Function to calculate Signal Magnitude Vector (SMV)
-        
-        Parameters:
-        - sample: Input signal array of shape (N, 3) for X,Y,Z accelerometer data
-        
-        Returns:
-        - SMV values of shape (N, 1)
-        '''
-        mean = np.mean(sample, axis=-2, keepdims=True)
-        zero_mean = sample - mean
-        sum_squared = np.sum(np.square(zero_mean), axis=-1, keepdims=True)
-        smv = np.sqrt(sum_squared)
-        return smv
